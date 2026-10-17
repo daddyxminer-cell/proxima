@@ -24,7 +24,11 @@
 #                  No rebuild; use 'update' when the version changed too
 #    build         only clone/pull + compile (no install, no services)
 #    start|stop|restart [node|miner|all]
-#    status        versions, services, sync state, wallet balance
+#    status        colour dashboard: node IP:port + peering address, sync, every
+#                  connected peer (RTT, traffic), wallet balance, delegations,
+#                  miner hashrate / difficulty / minted / expected rewards
+#    peers         all peers with full IDs and every multiaddress
+#    watch [secs]  the status dashboard, refreshed in place (default 10 s)
 #    logs [node|miner]   follow the logs
 #    remote <update|install|status|reset> user@host [user@host ...]
 #                  copy this script to each host over ssh and run it there
@@ -48,11 +52,12 @@
 #    --no-services         NO_SERVICES=1  do not create/start systemd units
 #    --reset-db            RESET_DB=1     wipe the node DB on update/reset even if
 #                                         the ledger looks unchanged
+#    --no-color            NO_COLOR=1     plain output (also automatic when piped)
 #    -y | --yes            ASSUME_YES=1   no confirmation prompts
 # =============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 REPO_URL="${REPO_URL:-https://github.com/lunfardo314/proxima.git}"
 
 # ---------- defaults ---------------------------------------------------------
@@ -74,14 +79,21 @@ ASSUME_YES="${ASSUME_YES:-0}"
 
 # public testnet access points (also rendered into proxima.yaml by proxi)
 PUBLIC_APIS=("http://65.21.170.230:8001" "http://79.137.70.25:8001" "http://51.254.47.76:8001")
+PUBLIC_NAMES=(hloc0 oseq1 oloc2)    # same order as PUBLIC_APIS
 
 NODE_SVC="proxima-node"
 MINER_SVC="proxima-miner"
 ENV_DIR="/etc/proxima"
 
 # ---------- output helpers ---------------------------------------------------
-if [[ -t 1 ]]; then C_B=$'\e[1m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_C=$'\e[36m'; C_0=$'\e[0m'
-else C_B=; C_G=; C_Y=; C_R=; C_C=; C_0=; fi
+COLOR="${COLOR:-1}"
+setup_colors() {
+  if [[ -z "${NO_COLOR:-}" && "$COLOR" != 0 && ( -t 1 || -n "${FORCE_COLOR:-}" ) ]]; then
+    C_B=$'\e[1m'; C_D=$'\e[90m'; C_G=$'\e[92m'; C_Y=$'\e[93m'; C_R=$'\e[91m'; C_C=$'\e[96m'
+    C_M=$'\e[95m'; C_BL=$'\e[94m'; C_W=$'\e[97m'; C_0=$'\e[0m'
+  else C_B=; C_D=; C_G=; C_Y=; C_R=; C_C=; C_M=; C_BL=; C_W=; C_0=; fi
+}
+setup_colors
 log()  { printf '%s[%s]%s %s\n' "$C_C" "$(date +%H:%M:%S)" "$C_0" "$*"; }
 ok()   { printf '%s  ✔%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '%s  !%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
@@ -136,12 +148,15 @@ while [[ $# -gt 0 ]]; do
     --no-node)     NO_NODE=1; shift;;
     --no-services) NO_SERVICES=1; shift;;
     --reset-db)    RESET_DB=1; shift;;
+    --no-color)    COLOR=0; shift;;
+    --color)       FORCE_COLOR=1; shift;;
     -y|--yes)      ASSUME_YES=1; shift;;
     -h|--help)     CMD=help; shift;;
     *)             ARGS+=("$1"); shift;;
   esac
 done
 set_paths
+setup_colors
 
 # =============================================================================
 #  Which ledger is the network on?  (testnet resets keep the version number)
@@ -159,6 +174,7 @@ net_get() { # net_get <api path> : first public node that answers
 }
 
 NET_HASH=""; NET_GENESIS=""; NET_DESC=""; NET_MINER_VER=""; NET_NODE_VER=""
+NET_UNIT=1000000; NET_TICKER=PROX; NET_REWARD=95000000; NET_SLOT_SEC=10.24
 load_net_info() {
   command -v jq >/dev/null || return 1
   local lc ni
@@ -167,6 +183,10 @@ load_net_info() {
   NET_GENESIS=$(jq -r '.genesis_time_unix // empty' <<<"$lc" 2>/dev/null || true)
   NET_DESC=$(jq -r '.description // empty' <<<"$lc" 2>/dev/null || true)
   NET_MINER_VER=$(jq -r '.miner_version // empty' <<<"$lc" 2>/dev/null || true)
+  NET_UNIT=$(jq -r '.smallest_amounts_per_base_token // empty' <<<"$lc" 2>/dev/null || true); NET_UNIT=${NET_UNIT:-1000000}
+  NET_TICKER=$(jq -r '.base_token_name_ticker // empty' <<<"$lc" 2>/dev/null || true); NET_TICKER=${NET_TICKER:-PROX}
+  NET_REWARD=$(jq -r '.mine_amount_base // empty' <<<"$lc" 2>/dev/null || true); NET_REWARD=${NET_REWARD:-95000000}
+  NET_SLOT_SEC=$(jq -r 'try (.ticks_per_slot * .tick_duration_ns / 1000000000) catch empty' <<<"$lc" 2>/dev/null || true); NET_SLOT_SEC=${NET_SLOT_SEC:-10.24}
   ni=$(net_get /api/v1/node_info) || ni=""
   NET_NODE_VER=$(jq -r '.version // empty' <<<"$ni" 2>/dev/null || true)
   [[ -n "$NET_GENESIS" ]]
@@ -686,44 +706,444 @@ wait_for_sync() {
   echo; warn "node not synced after 30 min — check: $0 logs node (the miner waits for it)"
 }
 
-cmd_status() {
-  step "Network"
+# =============================================================================
+#  Dashboard:  status  |  peers  |  watch
+# =============================================================================
+DASH_W=78
+
+rule()  { local s; printf -v s '%*s' "$1" ''; printf '%s' "${s// /─}"; }
+rep()   { local s="" i; for ((i = 0; i < $2; i++)); do s+="$1"; done; printf '%s' "$s"; }
+sect()  { printf '\n  %s%s▌ %s%s %s' "$C_B" "$C_M" "$1" "$C_0" "$C_D"; rule $((DASH_W - 6 - ${#1})); printf '%s\n' "$C_0"; }
+kv()    { printf '  %s%-17s%s %s\n' "$C_D" "$1" "$C_0" "$2"; }
+note()  { printf '  %s%s%s\n' "$C_D" "$*" "$C_0"; }
+pc()    { printf '%s%-*s%s' "$1" "$2" "$3" "$C_0"; }     # colour, width, text   (left aligned)
+pcr()   { printf '%s%*s%s'  "$1" "$2" "$3" "$C_0"; }     # colour, width, text   (right aligned)
+dot_on()  { printf '%s●%s' "$C_G" "$C_0"; }
+dot_off() { printf '%s○%s' "$C_R" "$C_0"; }
+dot_mid() { printf '%s◐%s' "$C_Y" "$C_0"; }
+
+thou()  { sed -E ':a;s/^([0-9]+)([0-9]{3})/\1,\2/;ta' <<<"${1//_/}"; }
+hdur()  { local s=${1%.*}; [[ "$s" =~ ^[0-9]+$ ]] || { echo "-"; return 0; }
+          if   (( s < 60 ));    then echo "${s}s"
+          elif (( s < 3600 ));  then echo "$((s / 60))m$((s % 60))s"
+          elif (( s < 86400 )); then echo "$((s / 3600))h$(((s % 3600) / 60))m"
+          else echo "$((s / 86400))d$(((s % 86400) / 3600))h"; fi; }
+fmt_prox() { # motes -> "1,234.5" (PROX)
+  local m="${1//_/}"; [[ "$m" =~ ^[0-9]+$ ]] || { echo "?"; return 0; }
+  awk -v m="$m" -v u="${NET_UNIT:-1000000}" 'BEGIN{printf "%.6f", m/u}' \
+    | sed -E ':a;s/^([0-9]+)([0-9]{3})/\1,\2/;ta' | sed -E '/\./{s/0+$//;s/\.$//}'
+}
+fmt_rate() { awk -v r="${1:-0}" 'BEGIN{ if (r>=1e6) printf "%.2f MH/s", r/1e6; else if (r>=1e3) printf "%.2f KH/s", r/1e3; else printf "%d H/s", r }'; }
+spark() { awk 'BEGIN{split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █",b," ")}
+  {v[NR]=$1; if(NR==1||$1<mn)mn=$1; if(NR==1||$1>mx)mx=$1}
+  END{for(i=1;i<=NR;i++){k=(mx>mn)?int((v[i]-mn)/(mx-mn)*7)+1:4; if(k>8)k=8; printf "%s",b[k]}}'; }
+bar() { # bar <value> <max> <width> <colour>
+  local v=$1 m=$2 w=$3 col=$4 f
+  f=$(awk -v v="$v" -v m="$m" -v w="$w" 'BEGIN{x=(m>0)?int(v/m*w+0.5):0; if(x>w)x=w; if(x<0)x=0; print x}')
+  printf '%s%s%s%s%s' "$col" "$(rep █ "$f")" "$C_D" "$(rep ░ $((w - f)))" "$C_0"
+}
+stackbar() { # stackbar <width> <a> <b> <c>   (cyan / green / magenta)
+  local w=$1 na nb nc
+  read -r na nb nc < <(awk -v a="$2" -v b="$3" -v c="$4" -v w="$w" \
+    'BEGIN{t=a+b+c; if(t<=0){print 0,0,0; exit} na=int(a/t*w+.5); nb=int(b/t*w+.5); nc=w-na-nb; if(nc<0)nc=0; print na,nb,nc}') || true
+  if (( na + nb + nc == 0 )); then printf '%s%s%s' "$C_D" "$(rep ░ "$w")" "$C_0"
+  else printf '%s%s%s%s%s%s%s' "$C_C" "$(rep █ "$na")" "$C_G" "$(rep █ "$nb")" "$C_M" "$(rep █ "$nc")" "$C_0"; fi
+}
+peer_name() { local ip="$1" i; for i in "${!PUBLIC_APIS[@]}"; do
+    if [[ "${PUBLIC_APIS[$i]}" == *"//$ip:"* ]]; then echo "${PUBLIC_NAMES[$i]:-public}"; return 0; fi; done; echo ""; }
+public_ip() { local u ip
+  for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip=$(curl -4fs -m 4 "$u" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then echo "$ip"; return 0; fi
+  done; return 0; }
+api_host() { awk '/^api:/{f=1;next} f&&/^[^ #]/{f=0} f&&/^  host:/{print $2;exit}' "$NODE_DIR/proxima.yaml" 2>/dev/null || true; }
+
+dash_banner() {
+  local title="  PROXIMA DASHBOARD" stamp; stamp="$(date -u '+%F %T') UTC  "
+  local pad=$((DASH_W - 4 - ${#title} - ${#stamp} - 2)); if (( pad < 1 )); then pad=1; fi
+  printf '\n  %s╭%s╮%s\n' "$C_C" "$(rule $((DASH_W - 4)))" "$C_0"
+  printf '  %s│%s %s◆%s%s%s%*s%s%s%s│%s\n' "$C_C" "$C_0" "$C_M$C_B" "$C_0" "$C_B$C_W" "$title" "$pad" "" "$C_D" "$stamp" "$C_C" "$C_0"
+  printf '  %s╰%s╯%s\n' "$C_C" "$(rule $((DASH_W - 4)))" "$C_0"
+}
+
+# ---- network ---------------------------------------------------------------
+dash_network() {
+  sect "NETWORK"
   if load_net_info; then
-    printf '  ledger    : %s\n  genesis   : %s UTC (hash %s…)\n  nodes run : %s | miner version %s\n' \
-      "${NET_DESC:-?}" "$(date -u -d "@$NET_GENESIS" '+%F %T' 2>/dev/null || echo "$NET_GENESIS")" "${NET_HASH:0:12}" \
-      "${NET_NODE_VER:-?}" "${NET_MINER_VER:-?}"
-    if [[ "$NO_NODE" != 1 && -f "$NODE_DIR/proxima.yaml" && "$(db_ledger_state)" == other ]]; then
-      warn "this node's DB is from an OLD ledger — run: $0 reset"
+    kv "ledger" "${C_B}${C_W}${NET_DESC:-?}${C_0}"
+    kv "genesis" "$(date -u -d "@$NET_GENESIS" '+%F %T' 2>/dev/null || echo "$NET_GENESIS") UTC   ${C_D}hash ${NET_HASH:0:12}…${C_0}"
+    kv "public nodes run" "${C_C}${NET_NODE_VER:-?}${C_0}   ${C_D}miner version ${NET_MINER_VER:-?}${C_0}"
+    local ps; ps=$(sync_info "${PUBLIC_APIS[0]}")
+    if [[ -n "$ps" ]]; then
+      PUB_LRB=$(jq -r '.lrb_slot // empty' <<<"$ps" 2>/dev/null || true)
+      kv "current slot" "${C_W}$(jq -r '.current_slot' <<<"$ps" 2>/dev/null || echo '?')${C_0}   ${C_D}network LRB slot ${PUB_LRB:-?}${C_0}"
+    fi
+    if [[ "$HAVE_NODE" == 1 && "$(db_ledger_state)" == other ]]; then
+      printf '  %s%s ✘ this node'"'"'s DB is from an OLD ledger — run: %s reset %s\n' "$C_B" "$C_R" "$0" "$C_0"
     fi
   else
-    warn "public nodes not reachable"
+    printf '  %s! public nodes not reachable%s\n' "$C_Y" "$C_0"
   fi
-  step "Versions"
-  printf '  installed : proxima %s | proxi %s%s\n' "$(installed_version)" \
-    "$("$BIN_DIR/proxi" version 2>/dev/null | awk '/Version:/{print $2}')" \
-    "$([[ -x $BIN_DIR/nonce_seeker ]] && echo ' | nonce_seeker yes')"
+}
+
+# ---- this node: address, sync, peers ---------------------------------------
+svc_state() { # svc_state node|miner -> active|inactive|running|stopped|none
+  local n="$1" unit="$NODE_SVC"; [[ "$n" == miner ]] && unit="$MINER_SVC"
+  if have_systemd && [[ -f "/etc/systemd/system/$unit.service" ]]; then systemctl is-active "$unit" 2>/dev/null || true; return 0; fi
+  local pf="$PROXIMA_HOME/$n.pid"
+  if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then echo running; return 0; fi
+  if [[ -n "$(find_proc "$n")" ]]; then echo running; return 0; fi     # started by hand
+  # installed but not running (a plain 'stop' removes the pid file)
+  if [[ -f "$pf" ]]; then echo stopped; return 0; fi
+  if [[ "$n" == node && -f "$NODE_DIR/proxima.yaml" ]]; then echo stopped; return 0; fi
+  if [[ "$n" == miner && -f "$WALLET_DIR/miner.log" ]]; then echo stopped; return 0; fi
+  echo none
+}
+find_proc() { # pid of a running node / miner, whatever started it
+  case "$1" in
+    node)  pgrep -n -f "^$BIN_DIR/proxima( |\$)" 2>/dev/null || true;;
+    miner) pgrep -n -f "^[^ ]*/proxi node mine" 2>/dev/null || true;;
+  esac
+}
+svc_pid() {
+  local n="$1" unit="$NODE_SVC" p=""; [[ "$n" == miner ]] && unit="$MINER_SVC"
+  if have_systemd && [[ -f "/etc/systemd/system/$unit.service" ]]; then p=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+  elif [[ -f "$PROXIMA_HOME/$n.pid" ]]; then p=$(cat "$PROXIMA_HOME/$n.pid" 2>/dev/null || true); fi
+  if [[ ! "$p" =~ ^[0-9]+$ ]] || ! kill -0 "$p" 2>/dev/null; then p=$(find_proc "$n"); fi
+  if [[ "$p" =~ ^[0-9]+$ && "$p" != 0 ]]; then echo "$p"; fi
+  return 0
+}
+svc_badge() { case "$1" in
+    active|running) printf '%s●%s %s%s%s' "$C_G" "$C_0" "$C_G" "$1" "$C_0";;
+    activating)     printf '%s◐%s %s%s%s' "$C_Y" "$C_0" "$C_Y" "$1" "$C_0";;
+    none)           printf '%s○ not installed%s' "$C_D" "$C_0";;
+    *)              printf '%s○%s %s%s%s' "$C_R" "$C_0" "$C_R" "$1" "$C_0";; esac; }
+proc_stats() { # pid -> "up 2h13m · 312 MB RSS · 14.2% CPU"
+  local pid="$1" et rss cpu; [[ -n "$pid" ]] || return 0
+  read -r et rss cpu < <(ps -o etimes=,rss=,pcpu= -p "$pid" 2>/dev/null) || return 0
+  printf 'up %s · %s MB RAM · %s%% CPU' "$(hdur "$et")" "$((rss / 1024))" "$cpu"
+}
+
+dash_node() {
+  sect "THIS NODE"
+  if [[ "$HAVE_NODE" != 1 ]]; then
+    kv "mode" "${C_D}no local node — wallet and miner use ${MINER_API:-a public node}${C_0}"; return 0
+  fi
+  local api; api=$(local_api)
+  local ni si st; ni=$(curl -fs -m 5 "$api/api/v1/node_info" 2>/dev/null || true); si=$(sync_info "$api")
+  st=$(svc_state node)
+  kv "service" "$(svc_badge "$st")   ${C_D}$(proc_stats "$(svc_pid node)")${C_0}"
+
+  if [[ -z "$ni" ]]; then
+    kv "api" "${C_R}not reachable at $api${C_0} ${C_D}(starting up or restoring the snapshot)${C_0}"
+    local last; last=$(tail -n 2 "$NODE_DIR/proxima.log" 2>/dev/null | cut -c1-110 || true)
+    [[ -n "$last" ]] && while IFS= read -r l; do note "log: $l"; done <<<"$last"
+    return 0
+  fi
+  local id ver commit stress pipe syncing nst ndy
+  IFS=$'\t' read -r id ver commit stress pipe syncing nst ndy < <(jq -r \
+    '[.id,.version,(.commit_hash[0:8]),(.memory_stress_level//0),(.pipeline_size//0),(.is_syncing//false),(.num_static_peers//0),(.num_dynamic_alive//0)]|@tsv' <<<"$ni" 2>/dev/null) || true
+
+  local synced cur lrb; synced=$(jq -r '.synced' <<<"$si" 2>/dev/null || echo false)
+  cur=$(jq -r '.current_slot // 0' <<<"$si" 2>/dev/null || echo 0); lrb=$(jq -r '.lrb_slot // 0' <<<"$si" 2>/dev/null || echo 0)
+  local behind=$((cur - lrb)) lag=""
+  if [[ "${PUB_LRB:-}" =~ ^[0-9]+$ ]]; then lag="   ${C_D}network LRB ${PUB_LRB} → $((PUB_LRB - lrb)) slots behind${C_0}"; fi
+  if [[ "$synced" == true ]]; then
+    kv "sync" "$(dot_on) ${C_G}${C_B}SYNCED${C_0}   ${C_D}slot${C_0} ${C_W}$cur${C_0} ${C_D}· LRB${C_0} ${C_W}$lrb${C_0} ${C_D}(${behind} behind)${C_0}$lag"
+  else
+    kv "sync" "$(dot_mid) ${C_Y}${C_B}SYNCING${C_0}   ${C_D}slot${C_0} ${C_W}$cur${C_0} ${C_D}· LRB${C_0} ${C_W}$lrb${C_0} ${C_Y}(${behind} behind)${C_0}$lag"
+  fi
+  kv "version" "${C_C}${ver:-?}${C_0} ${C_D}(${commit:-?})${C_0}"
+
+  # --- addresses
+  local pip pport aport ahost lips
+  pip=$(public_ip); pport=$(peering_port); aport=$(api_port); ahost=$(api_host)
+  lips=$(hostname -I 2>/dev/null | xargs || true)
+  kv "host (peer) ID" "${C_W}$id${C_0}"
+  if [[ -n "$pip" ]]; then
+    kv "public IP" "${C_B}${C_G}$pip${C_0}   ${C_D}local: ${lips:-?}${C_0}"
+    kv "peering (UDP)" "${C_B}${C_C}$pip:$pport${C_0}   ${C_D}QUIC — must be open inbound${C_0}"
+    kv "multiaddr" "${C_D}/ip4/${C_0}$pip${C_D}/udp/$pport/quic-v1/p2p/${C_0}${C_D}$id${C_0}"
+    if [[ " $lips " != *" $pip "* ]]; then note "                    public IP is not on a local interface (NAT?): forward UDP $pport"; fi
+    if [[ -n "$ahost" && "$ahost" == 127.* ]]; then
+      kv "API (TCP)" "${C_B}${C_C}127.0.0.1:$aport${C_0}   ${C_D}local only${C_0}"
+    else
+      kv "API (TCP)" "${C_B}${C_C}$pip:$aport${C_0}   ${C_D}http://$pip:$aport/dashboard${C_0}"
+    fi
+  else
+    kv "peering (UDP)" "${C_B}${C_C}<this-host>:$pport${C_0}   ${C_D}public IP lookup failed${C_0}"
+    kv "API (TCP)" "${C_B}${C_C}<this-host>:$aport${C_0}"
+  fi
+  local sc=$C_G; if (( ${stress:-0} >= 3 )); then sc=$C_R; elif (( ${stress:-0} >= 2 )); then sc=$C_Y; fi
+  kv "load" "${C_D}memory stress${C_0} ${sc}${stress:-0}${C_0}  ${C_D}· pipeline${C_0} ${C_W}$(thou "${pipe:-0}")${C_0}"
+  # --- disk
+  local kb; kb=$(du -sck "$NODE_DIR"/proximadb* 2>/dev/null | tail -1 | awk '{print $1}' || true)
+  local free; free=$(df -Pk "$NODE_DIR" 2>/dev/null | awk 'NR==2{printf "%.1f GB free", $4/1048576}' || true)
+  if [[ "$kb" =~ ^[0-9]+$ ]]; then kv "database" "${C_W}$(awk -v k="$kb" 'BEGIN{ if (k>=1048576) printf "%.2f GB", k/1048576; else printf "%.0f MB", k/1024 }')${C_0}   ${C_D}$free${C_0}"; fi
+
+  # --- peers
+  local pi; pi=$(curl -fs -m 6 "$api/api/v1/peers_info" 2>/dev/null || true)
+  dash_peers "$pi" 14 "$nst" "$ndy"
+}
+
+dash_peers() { # <peers_info json> <max rows> [static count] [dyn alive]
+  local pi="$1" max="${2:-14}" total=0 alive=0 sumrtt=0 nrtt=0
+  sect "CONNECTED PEERS"
+  if [[ -z "$pi" ]] || ! jq -e '.peers' >/dev/null 2>&1 <<<"$pi"; then
+    if [[ -n "$pi" ]]; then printf '  %s○ no peers connected yet%s\n' "$C_Y" "$C_0"
+    else printf '  %s! peers_info not available%s\n' "$C_Y" "$C_0"; fi
+    return 0
+  fi
+  local rows; rows=$(jq -r '(.peers // []) | sort_by((if .is_static then 0 else 1 end), (if .is_alive then 0 else 1 end), (.rtt_ms // 99999)) | .[]
+    | def hp: split("/") | if length>4 then (if .[1]=="ip6" then "["+.[2]+"]" else .[2] end)+":"+.[4] else "-" end;
+      ((.multiAddresses // []) as $m | (([$m[]|select(startswith("/ip4/"))]+$m)[0] // "") | hp) as $a
+    | [.id, $a, .is_static, .is_alive, (.rtt_ms // -1 | floor), (.num_incoming_tx // 0), (((now - (.when_added // 0)/1e9)) | floor)] | @tsv' <<<"$pi" 2>/dev/null || true)
+  total=$(wc -l <<<"$rows" | tr -d ' '); [[ -n "$rows" ]] || total=0
+  local id addr stat al rtt tx age n=0 nstat=0 nstat_alive=0 best=999999
+  while IFS=$'\t' read -r id addr stat al rtt tx age; do
+    [[ -n "$id" ]] || continue
+    [[ "$al" == true ]] && alive=$((alive + 1))
+    if [[ "$stat" == true ]]; then nstat=$((nstat + 1)); [[ "$al" == true ]] && nstat_alive=$((nstat_alive + 1)); fi
+    if [[ "$al" == true && "$rtt" -ge 0 ]]; then sumrtt=$((sumrtt + rtt)); nrtt=$((nrtt + 1)); (( rtt < best )) && best=$rtt; fi
+  done <<<"$rows"
+  local avg="-"; (( nrtt > 0 )) && avg=$((sumrtt / nrtt))
+  local hc=$C_G; if (( total == 0 || alive == 0 )); then hc=$C_R; elif (( alive < 3 )); then hc=$C_Y; fi
+  printf '  %s%s%s %s%s%s %salive of%s %s%s%s   %s%s static · %s autopeered%s' \
+    "$hc" "$(bar "$alive" "$(( total > 0 ? total : 1 ))" 16 "$hc")" "$C_0" "$C_B$hc" "$alive" "$C_0" "$C_D" "$C_0" "$C_W" "$total" "$C_0" "$C_D" "$nstat_alive/$nstat" "$((alive - nstat_alive))" "$C_0"
+  if (( nrtt > 0 )); then printf '   %savg RTT %s ms · best %s ms%s' "$C_D" "$avg" "$best" "$C_0"; fi
+  printf '\n\n'
+  printf '  %s  %-6s %-6s %-12s %-21s %6s %7s %6s%s\n' "$C_D" "TYPE" "NAME" "PEER ID" "ADDRESS (UDP)" "RTT" "TX-IN" "AGE" "$C_0"
+  while IFS=$'\t' read -r id addr stat al rtt tx age; do
+    [[ -n "$id" ]] || continue
+    if (( n >= max )); then note "  … and $((total - max)) more — run: $0 peers"; break; fi
+    n=$((n + 1))
+    local d tcol=$C_D tname="auto" rc=$C_G nm ip rt="-" sid
+    if [[ "$al" == true ]]; then d=$(dot_on); else d=$(dot_off); fi
+    if [[ "$stat" == true ]]; then tcol=$C_BL; tname="static"; fi
+    ip=${addr%:*}; ip=${ip#[}; ip=${ip%]}; nm=$(peer_name "$ip")
+    if (( rtt >= 0 )); then rt="${rtt} ms"; fi
+    if (( rtt >= 250 )); then rc=$C_R; elif (( rtt >= 100 )); then rc=$C_Y; fi
+    [[ "$al" == true ]] || rc=$C_D
+    sid="${id:8:5}…${id: -6}"
+    printf '  %s %s %s %s%s%s %s %s %s %s\n' "$d" "$(pc "$tcol" 6 "$tname")" "$(pc "$C_M$C_B" 6 "$nm")" \
+      "$C_W" "$sid" "$C_0" "$(pc "$C_C" 21 "$addr")" "$(pcr "$rc" 6 "$rt")" "$(pcr "$C_D" 7 "$(thou "$tx")")" "$(pcr "$C_D" 6 "$(hdur "$age")")"
+  done <<<"$rows"
+  return 0
+}
+
+# ---- wallet: balance + delegations -----------------------------------------
+dash_wallet() {
+  sect "WALLET"
+  if [[ ! -f "$WALLET_DIR/proxi.yaml" ]]; then kv "wallet" "${C_D}not configured${C_0}"; return 0; fi
+  local tb td; tb=$(mktemp); td=$(mktemp)
+  ( cd "$WALLET_DIR" && timeout 40 "$BIN_DIR/proxi" node balance </dev/null >"$tb" 2>&1 || true ) &
+  ( cd "$WALLET_DIR" && timeout 40 "$BIN_DIR/proxi" node delegate status </dev/null >"$td" 2>&1 || true ) &
+  wait
+  local B; B=$(tr -d '\r' <"$tb"); local D; D=$(tr -d '\r' <"$td"); rm -f "$tb" "$td"
+
+  local acct; acct=$(sed -nE 's/^ *wallet account[^:]*: *([^ ]+).*/\1/p' <<<"$B" | head -1 || true)
+  [[ -n "$acct" ]] && kv "account" "${C_W}$acct${C_0}"
+  if ! grep -q 'SUMMARY controlled' <<<"$B"; then
+    local msg; msg=$(grep -vE '^(Command line|config profile)' <<<"$B" | tail -n 2 | cut -c1-100 || true)
+    kv "balance" "${C_R}unavailable${C_0} ${C_D}(node not synced yet, or the key is encrypted)${C_0}"
+    [[ -n "$msg" ]] && while IFS= read -r l; do note "  $l"; done <<<"$msg"
+    return 0
+  fi
+  local nc_n nc_v dl_n dl_v ch_n ch_v tot_n tot_v
+  read -r nc_n nc_v < <(sed -nE 's/^ *on +([0-9]+) non-chain outputs: +([0-9_]+).*/\1 \2/p' <<<"$B" | head -1) || true
+  read -r dl_n dl_v < <(sed -nE 's/^ *on +([0-9]+) delegation outputs: +([0-9_]+).*/\1 \2/p' <<<"$B" | head -1) || true
+  read -r ch_n ch_v < <(sed -nE 's/^ *on +([0-9]+) non-delegation chain outputs: +([0-9_]+).*/\1 \2/p' <<<"$B" | head -1) || true
+  read -r tot_n tot_v < <(sed -nE 's/^ *TOTAL controlled on ([0-9]+) outputs: +([0-9_]+).*/\1 \2/p' <<<"$B" | head -1) || true
+  nc_v=${nc_v//_/}; dl_v=${dl_v//_/}; ch_v=${ch_v//_/}; tot_v=${tot_v//_/}
+  local tick="${NET_TICKER:-PROX}"
+  kv "TOTAL" "${C_B}${C_G}$(fmt_prox "${tot_v:-0}") $tick${C_0}   ${C_D}on ${tot_n:-0} outputs${C_0}"
+  printf '  %s%-17s%s %s\n' "$C_D" "" "$C_0" "$(stackbar 44 "${nc_v:-0}" "${dl_v:-0}" "${ch_v:-0}")"
+  kv "${C_C}■${C_0}${C_D} liquid${C_0}" "${C_W}$(fmt_prox "${nc_v:-0}") $tick${C_0}   ${C_D}${nc_n:-0} plain outputs${C_0}"
+  kv "${C_G}■${C_0}${C_D} delegated${C_0}" "${C_W}$(fmt_prox "${dl_v:-0}") $tick${C_0}   ${C_D}${dl_n:-0} delegations${C_0}"
+  kv "${C_M}■${C_0}${C_D} other chains${C_0}" "${C_W}$(fmt_prox "${ch_v:-0}") $tick${C_0}   ${C_D}${ch_n:-0} chain outputs${C_0}"
+  local lrbs; lrbs=$(sed -nE 's/^ *Latest reliable branch \(LRB\) txid: *([^ ]+).*/\1/p' <<<"$B" | head -1 || true)
+  [[ -n "$lrbs" ]] && kv "as of LRB" "${C_D}${lrbs:0:44}…${C_0}"
+
+  # ---- delegations
+  local drows; drows=$(awk '/^ *DELEGATIONS \(/{f=1;next} f&&/^[A-Z]/{f=0} f&&/^ *(\$\/)?[0-9a-fA-F]{20,} /{print}' <<<"$B" || true)
+  sect "DELEGATIONS"
+  if [[ -z "$drows" ]]; then
+    printf '  %s○ none yet%s %s— mining rewards are paid into delegations once the miner has won transits%s\n' "$C_Y" "$C_0" "$C_D" "$C_0"
+    return 0
+  fi
+  local tmap; tmap=$(grep -E '^ *(\$/)?[0-9a-fA-F]{20,} .* -> ' <<<"$D" | awk '{print $1" "$NF}' || true)
+  printf '  %s  %-3s %-19s %17s  %-36s %s%s\n' "$C_D" "#" "CHAIN ID" "BALANCE" "STATUS" "TARGET" "$C_0"
+  local i=0 id bal rest status tgt sc
+  while read -r id bal rest; do
+    [[ -n "$id" ]] || continue
+    i=$((i + 1))
+    local full="$id"; id=${id#\$/}
+    status=${rest%% maxFrozen*}; status=${status%,}
+    status=$(sed -E 's/\(([0-9]+) hours?, ([0-9]+) min from now\)/(\1h\2m)/; s/\(([0-9]+) min from now\)/(\1m)/; s/until slot/→ slot/; s/for ([0-9]+) min more/\1m left/' <<<"$status")
+    tgt=$(awk -v i="$full" '$1==i{print $2;exit}' <<<"$tmap" || true); tgt=${tgt#\$/}
+    case "$status" in
+      frozen*)           sc=$C_Y;; "safe revocation"*) sc=$C_M;; "can be unlocked"*) sc=$C_G;; "on hold"*) sc=$C_R;; *) sc=$C_W;; esac
+    printf '  %s  %s %s%s…%s%s %s %s  %s %s%s%s\n' "$C_D" "$(printf '%-3s' "$i")" "$C_W" "${id:0:12}" "${id: -6}" "$C_0" \
+      "$(pcr "$C_G$C_B" 17 "$(fmt_prox "$bal")")" "$C_D$tick$C_0" "$(pc "$sc" 36 "${status:0:36}")" "$C_C" "${tgt:+${tgt:0:10}…${tgt: -6}}" "$C_0"
+  done <<<"$drows"
+  return 0
+}
+
+# ---- miner: hashrate --------------------------------------------------------
+miner_log() {
+  local o=""
+  if have_systemd && [[ -f "/etc/systemd/system/$MINER_SVC.service" ]]; then
+    o=$(journalctl -u "$MINER_SVC" --no-pager -n 1500 -o cat 2>/dev/null || true)
+    [[ -n "$o" ]] || o=$(sudo -n journalctl -u "$MINER_SVC" --no-pager -n 1500 -o cat 2>/dev/null || true)
+  else
+    o=$(tail -c 80000 "$WALLET_DIR/miner.log" 2>/dev/null || true)
+  fi
+  printf '%s' "$o" | tr '\r' '\n'
+}
+
+dash_miner() {
+  sect "MINER"
+  local st; st=$(svc_state miner)
+  local pid cmd; pid=$(svc_pid miner); cmd=""
+  if [[ -n "$pid" ]]; then cmd=$(ps -o args= -p "$pid" 2>/dev/null || true); fi
+  kv "service" "$(svc_badge "$st")   ${C_D}$(proc_stats "$pid")${C_0}"
+  if [[ "$st" == none ]]; then return 0; fi
+
+  local workers seeker cap
+  workers=$(grep -oE -- '--workers +[0-9]+' <<<"$cmd" | awk '{print $2}' || true); [[ -n "$workers" ]] || workers="all $(nproc 2>/dev/null || echo '?') cores"
+  seeker="no"; if grep -q -- '--seeker' <<<"$cmd"; then seeker="${C_G}yes (Rust nonce_seeker)${C_0}"; fi
+  cap=$(grep -oE -- '--max-hashrate-khs +[0-9.]+' <<<"$cmd" | awk '{print $2" KH/s cap"}' || true)
+  kv "workers" "${C_W}$workers${C_0}   ${C_D}seeker:${C_0} $seeker${cap:+   ${C_D}$cap${C_0}}"
+
+  local log; log=$(miner_log)
+  if [[ -z "$log" ]]; then
+    kv "hashrate" "${C_Y}no log readable${C_0} ${C_D}(run as root to read the miner journal)${C_0}"; return 0
+  fi
+  local rate="" samples="" tot="" k="" solved=0 improved=0 err="" tslot="" lastn=""
+  local key val
+  while IFS=$'\t' read -r key val; do
+    case "$key" in rate) rate=$val;; samples) samples=$val;; tot) tot=$val;; k) k=$val;; solved) solved=$val;;
+                   improved) improved=$val;; err) err=$val;; tslot) tslot=$val;; lastn) lastn=$val;; esac
+  done < <(awk '
+    { if (match($0,/mining\.\.\. [0-9_]+ attempts +[0-9_]+ H\/s/)) { s=substr($0,RSTART,RLENGTH); n=split(s,f," "); r=f[4]; gsub(/_/,"",r); sm[++ns]=r }
+      if (index($0,"totals:")) tot=substr($0,index($0,"totals:"))
+      if (match($0,/difficulty K=[0-9]+/)) k=substr($0,RSTART+13,RLENGTH-13)
+      if (match($0,/target slot [0-9]+/)) ts=substr($0,RSTART+12,RLENGTH-12)
+      if (match($0,/mining transit #[0-9]+/)) ln=substr($0,RSTART+16,RLENGTH-16)
+      if (index($0,"SOLVED transit")) sv++
+      if (index($0,"IMPROVED transit")) im++
+      if (index($0,"submit failed")||index($0,"not answering")||index($0,"Error:")) er=$0 }
+    END { if (ns>0) { print "rate\t" sm[ns]; s=""; st=(ns>40)?ns-39:1; for(i=st;i<=ns;i++) s=s sm[i] " "; print "samples\t" s }
+          print "tot\t" tot; print "k\t" k; print "solved\t" sv+0; print "improved\t" im+0; print "err\t" er; print "tslot\t" ts; print "lastn\t" ln }' <<<"$log") || true
+
+  if [[ "$rate" =~ ^[0-9]+$ ]]; then
+    local avg peak; read -r avg peak < <(awk '{n=0;s=0;m=0; for(i=1;i<=NF;i++){ if(NF>5 && i<=2) continue; s+=$i;n++; if($i>m)m=$i } printf "%d %d", (n?s/n:0), m}' <<<"$samples") || true
+    kv "hashrate" "${C_B}${C_G}$(fmt_rate "$rate")${C_0}   ${C_D}avg${C_0} ${C_W}$(fmt_rate "${avg:-0}")${C_0}  ${C_D}peak${C_0} ${C_W}$(fmt_rate "${peak:-0}")${C_0}"
+    local sp; sp=$(tr ' ' '\n' <<<"$samples" | awk 'NF' | spark)
+    [[ -n "$sp" ]] && kv "recent" "${C_C}$sp${C_0}"
+  else
+    kv "hashrate" "${C_Y}no samples yet${C_0} ${C_D}(waiting for the node to sync / next mining round)${C_0}"
+  fi
+
+  # --- totals reported by the miner itself
+  local re='confirmed ([0-9]+) \(\+([0-9]+) in flight, ([0-9]+) orphaned, ([0-9]+) tracked\) \| minted ([0-9_]+) \| K=([0-9]+) \| attempts ([0-9_]+) \| avg ([0-9_]+) H/s \| uptime ([^ ]+)'
+  if [[ "$tot" =~ $re ]]; then
+    kv "transits" "${C_G}${C_B}${BASH_REMATCH[1]}${C_0} ${C_D}confirmed${C_0}  ${C_Y}${BASH_REMATCH[2]}${C_0} ${C_D}in flight${C_0}  ${C_R}${BASH_REMATCH[3]}${C_0} ${C_D}orphaned${C_0}"
+    kv "minted" "${C_B}${C_G}$(fmt_prox "${BASH_REMATCH[5]}") ${NET_TICKER:-PROX}${C_0}   ${C_D}attempts $(thou "${BASH_REMATCH[7]}")  ·  avg $(thou "${BASH_REMATCH[8]}") H/s  ·  session ${BASH_REMATCH[9]}${C_0}"
+    [[ -n "$k" ]] || k=${BASH_REMATCH[6]}
+  else
+    kv "transits" "${C_D}none confirmed yet in the visible log${C_0}"
+  fi
+  if [[ "$k" =~ ^[0-9]+$ ]]; then
+    kv "difficulty" "${C_W}K=$k${C_0} ${C_D}(a nonce needs $k trailing zero bits)${C_0}${lastn:+   ${C_D}working on transit #$lastn${tslot:+, slot $tslot}${C_0}}"
+    if [[ "$rate" =~ ^[0-9]+$ && "$rate" -gt 0 ]]; then
+      local est; est=$(awk -v r="$rate" -v k="$k" -v s="${NET_SLOT_SEC:-10.24}" -v rw="${NET_REWARD:-95000000}" -v u="${NET_UNIT:-1000000}" \
+        'BEGIN{ n=2^k; p=1-exp(-r*s/n); if (p<=0) p=1e-12; t=s/p; perday=p*86400/s;   # at most one step per slot
+                printf "%d %.4f %.2f %.1f", t, p*100, perday, perday*rw/u }') || true
+      local t_s p_s pd rwd; read -r t_s p_s pd rwd <<<"$est"
+      kv "best case" "${C_W}1 solution per ~$(hdur "$t_s")${C_0} ${C_D}· ${p_s}% per slot · at most ≈ ${rwd} ${NET_TICKER:-PROX}/day${C_0}"
+      note "                    (upper bound: assumes no rival miners and no contested slots; real income is lower)"
+    fi
+  fi
+  if (( solved + improved > 0 )); then kv "recent finds" "${C_G}${solved}${C_0} ${C_D}solved ·${C_0} ${C_G}${improved}${C_0} ${C_D}improved (in visible log)${C_0}"; fi
+  if [[ -n "$err" ]]; then kv "last problem" "${C_Y}${err:0:90}${C_0}"; fi
+}
+
+dash_software() {
+  sect "SOFTWARE"
+  local iv pv; iv=$(installed_version); pv=$("$BIN_DIR/proxi" version 2>/dev/null | awk '/Version:/{print $2}' || true)
+  kv "installed" "proxima ${C_C}${iv:-?}${C_0}  ${C_D}·${C_0}  proxi ${C_C}${pv:-?}${C_0}$([[ -x $BIN_DIR/nonce_seeker ]] && echo "  ${C_D}·${C_0}  nonce_seeker ${C_G}yes${C_0}")"
   if [[ -d "$SRC_DIR/.git" ]]; then
     git -C "$SRC_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null || true
-    local remote_v; remote_v=$(git -C "$SRC_DIR" show "origin/$BRANCH:global/version.go" 2>/dev/null | grep -oE 'Version\s+=\s+"[^"]+"' | cut -d'"' -f2)
-    printf '  upstream  : %s %s (%s)\n' "$BRANCH" "$remote_v" "$(git -C "$SRC_DIR" log -1 --format=%h "origin/$BRANCH" 2>/dev/null)"
-    [[ -n "$remote_v" && "$remote_v" != "$(installed_version)" ]] && warn "update available: $0 update"
+    local rv; rv=$(git -C "$SRC_DIR" show "origin/$BRANCH:global/version.go" 2>/dev/null | grep -oE 'Version\s+=\s+"[^"]+"' | cut -d'"' -f2 || true)
+    local rh; rh=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true); local oh; oh=$(git -C "$SRC_DIR" rev-parse "origin/$BRANCH" 2>/dev/null || true)
+    if [[ -n "$rv" && ( "$rv" != "$iv" || "$rh" != "$oh" ) ]]; then
+      kv "upstream" "${C_Y}$BRANCH has ${rv} (${oh:0:8}) — update available: ${C_B}$0 update${C_0}"
+    else kv "upstream" "${C_G}up to date${C_0} ${C_D}($BRANCH ${rv:-?})${C_0}"; fi
   fi
-  step "Services"
-  if have_systemd; then
-    for s in $(svc_list all); do printf '  %-15s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || true)"; done
-  else
-    for n in node miner; do local pf="$PROXIMA_HOME/$n.pid"
-      printf '  %-15s %s\n' "$n" "$([[ -f $pf ]] && kill -0 "$(cat "$pf")" 2>/dev/null && echo running || echo stopped)"; done
-  fi
-  if [[ "$NO_NODE" != 1 && -f "$NODE_DIR/proxima.yaml" ]]; then
-    step "Local node"; echo "  $(sync_info "http://127.0.0.1:$(api_port)" | tr -d '\n ' || echo 'API not reachable')"
-  fi
-  step "Network (public node)"; echo "  $(sync_info "${PUBLIC_APIS[0]}" | tr -d '\n ')"
-  if [[ -f "$WALLET_DIR/proxi.yaml" ]]; then
-    step "Wallet"
-    ( cd "$WALLET_DIR" && timeout 30 "$BIN_DIR/proxi" node balance 2>&1 | grep -v '^Command line' | sed 's/^/  /' ) || true
-    ( cd "$WALLET_DIR" && timeout 30 "$BIN_DIR/proxi" node delegate status 2>&1 | grep -v '^Command line' | tail -n 15 | sed 's/^/  /' ) || true
-  fi
+}
+
+dash_footer() {
+  local me="${0##*/}" d="${C_D}·${C_0}"
+  printf '\n  %s' "$C_D"; rule $((DASH_W - 4)); printf '%s\n' "$C_0"
+  printf '  %s%s logs miner|node%s %s %s%s peers%s %s %s%s watch [secs]%s %s %s%s update%s %s %s%s reset%s\n' \
+    "$C_C" "$me" "$C_0" "$d" "$C_C" "$me" "$C_0" "$d" "$C_C" "$me" "$C_0" "$d" "$C_C" "$me" "$C_0" "$d" "$C_C" "$me" "$C_0"
+}
+
+cmd_status() {
+  HAVE_NODE=0; PUB_LRB=""
+  if [[ "$NO_NODE" != 1 && -f "$NODE_DIR/proxima.yaml" ]]; then HAVE_NODE=1; fi
+  [[ -n "$MINER_API" ]] || MINER_API=$(awk '/node_url:/{print $2;exit}' "$WALLET_DIR/proxi.yaml" 2>/dev/null || true)
+  dash_banner
+  dash_network
+  dash_node
+  dash_wallet
+  dash_miner
+  dash_software
+  dash_footer
+}
+
+# all peers, full IDs and every multiaddress
+cmd_peers() {
+  [[ -f "$NODE_DIR/proxima.yaml" ]] || die "no local node installed here"
+  local pi; pi=$(curl -fs -m 8 "$(local_api)/api/v1/peers_info" 2>/dev/null || true)
+  [[ -n "$pi" ]] || die "node API not reachable at $(local_api)"
+  dash_banner
+  sect "PEERS (full)"
+  printf '  %s%s%s\n' "$C_D" "host ID  $(jq -r .host_id <<<"$pi")" "$C_0"
+  local rows; rows=$(jq -c '(.peers // []) | sort_by((if .is_static then 0 else 1 end), (if .is_alive then 0 else 1 end), (.rtt_ms // 99999)) | .[]' <<<"$pi")
+  local n=0 line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    n=$((n + 1))
+    local id al stat rtt tx pull age d tc="auto" ip nm
+    id=$(jq -r .id <<<"$line"); al=$(jq -r .is_alive <<<"$line"); stat=$(jq -r .is_static <<<"$line")
+    rtt=$(jq -r '(.rtt_ms // -1) | floor' <<<"$line"); tx=$(jq -r '.num_incoming_tx // 0' <<<"$line"); pull=$(jq -r '.num_incoming_pull // 0' <<<"$line")
+    age=$(jq -r '((now - (.when_added // 0)/1e9) | floor)' <<<"$line")
+    if [[ "$al" == true ]]; then d=$(dot_on); else d=$(dot_off); fi
+    [[ "$stat" == true ]] && tc="static"
+    ip=$(jq -r '((.multiAddresses // [])[]|select(startswith("/ip4/")))' <<<"$line" | head -1 | awk -F/ '{print $3}' || true)
+    nm=$(peer_name "${ip:-x}")
+    printf '\n  %s %s%s%2d%s  %s%s%s %s%s%s\n' "$d" "$C_D" "" "$n" "$C_0" "$C_W" "$id" "$C_0" "$C_M$C_B" "$nm" "$C_0"
+    printf '      %s%-6s%s  rtt %s  ·  tx-in %s  ·  pull-in %s  ·  connected %s%s\n' "$C_D" "$tc" "$C_0" "$( ((rtt >= 0)) && echo "${rtt} ms" || echo -)" "$(thou "$tx")" "$(thou "$pull")" "$(hdur "$age")" "$C_0"
+    jq -r '(.multiAddresses // [])[]' <<<"$line" | while IFS= read -r a; do printf '      %s%s%s\n' "$C_C" "$a" "$C_0"; done
+  done <<<"$rows"
+  (( n > 0 )) || printf '  %sno peers connected%s\n' "$C_Y" "$C_0"
+  echo
+}
+
+# live dashboard, refreshed in place
+cmd_watch() {
+  local n="${1:-10}"; [[ "$n" =~ ^[0-9]+$ && "$n" -ge 3 ]] || n=10
+  [[ -t 1 ]] || die "watch needs a terminal"
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true; printf "\n"; exit 0' INT TERM
+  local out
+  while true; do
+    out=$(cmd_status 2>&1 | sed 's/$/\x1b[K/' || true)
+    printf '\e[H%s\n\n  %srefreshing every %ss — Ctrl-C to quit%s\e[K\n\e[J' "$out" "$C_D" "$n" "$C_0"
+    sleep "$n"
+  done
 }
 
 cmd_logs() {
@@ -912,6 +1332,8 @@ case "$CMD" in
   install)   cmd_install;;
   update)    cmd_update;;
   reset)     cmd_reset;;
+  peers)     cmd_peers;;
+  watch|dashboard) cmd_watch "${ARGS[0]:-10}";;
   build)     cmd_build;;
   start|stop|restart) svc "$CMD" "${ARGS[0]:-all}";;
   status)    cmd_status;;
