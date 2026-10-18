@@ -6,7 +6,10 @@
 #  somewhere else.  No node, no database: it builds `proxi` from
 #  https://github.com/lunfardo314/proxima (master) and runs `proxi node mine --seeker`
 #  with a CUDA nonce seeker (`gpu_seeker`, sources shipped inside this script).
-#  Target network: Proxima testnet 5 (v0.13.x-testnet).
+#  Target network: Proxima "take 1" (v1.0.x-take1, miner version 4).
+#  Built for proxi v1.0.1-take1 (the miner extends the canonical branch, not the tallest).
+#  Note: the key is held in the seeker's memory while it mines - use a dedicated wallet on
+#  machines you control (see proxi/node_cmd/mine/nonce_seeker/README.md upstream).
 #  Same configuration, prompts, flags and commands as proxima-miner.sh (CPU), plus GPU options.
 #
 #  GPUs: written for NVIDIA RTX 4000 (Ada, sm_89) and RTX 5000 (Blackwell, sm_120); other
@@ -81,7 +84,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"          # CPU+GPU edition (proxima-miner.sh is the CPU-only one)
+SCRIPT_VERSION="1.1.0"          # CPU+GPU edition (proxima-miner.sh is the CPU-only one)
 DEFAULT_NODE_URL="${DEFAULT_NODE_URL:-http://161.97.92.49:8000}"
 REPO_URL="${REPO_URL:-https://github.com/lunfardo314/proxima.git}"
 
@@ -110,7 +113,7 @@ WITH_SEEKER=0                          # 1 once the GPU seeker (Rust + CUDA) is 
 CUDA_REDIST_VERSION="${CUDA_REDIST_VERSION:-12.9.1}"   # private CUDA toolkit pieces (nvcc, cudart, cccl)
 MIN_RUST="1.88"                        # the proxima crates need it
 
-# public testnet nodes: independent witnesses for the ledger-library proof and extra
+# public network nodes: independent witnesses for the ledger-library proof and extra
 # mining-transaction streams (so that no single node can withhold a competitor's tx)
 PUBLIC_APIS=("http://65.21.170.230:8001" "http://79.137.70.25:8001" "http://51.254.47.76:8001")
 PUBLIC_NAMES=(hloc0 oseq1 oloc2)
@@ -359,7 +362,7 @@ choose_node() {
       else warn "node reports NOT synced (slot ${NP_CUR:-?}, LRB ${NP_LRB:-?}) — the miner will wait for it"; fi
       pg=$(public_genesis)
       if [[ -n "$pg" && -n "$NP_GEN" && "$pg" != "$NP_GEN" ]]; then
-        warn "this node's ledger (genesis $NP_GEN) differs from the public testnet ($pg):"
+        warn "this node's ledger (genesis $NP_GEN) differs from the public network ($pg):"
         warn "it is probably on an OLD ledger — run 'proxima-setup.sh reset' on the node first."
         confirm "use it anyway?" n || { NODE_URL=""; cur="$url"; continue; }
       fi
@@ -471,7 +474,7 @@ check_compat() {
   log "network ledger: ${C_B}${NET_DESC:-?}${C_0}  genesis $(date -u -d "@$NET_GENESIS" '+%F %T' 2>/dev/null || echo "$NET_GENESIS") UTC  nodes ${NET_NODE_VER:-?}"
   if [[ -n "${SRC_VERSION:-}" && -n "$NET_NODE_VER" && "$(minor_of "$SRC_VERSION")" != "$(minor_of "$NET_NODE_VER")" ]]; then
     warn "source is $SRC_VERSION but the network runs $NET_NODE_VER — a different minor version is usually incompatible."
-    warn "pin a matching tag or commit with --branch <tag|commit> (v0.13.10-testnet = commit 57d9606a)."
+    warn "pin a matching tag or commit with --branch <tag|commit> (v1.0.1-take1 = commit f5370038)."
   fi
   local mv; mv=$(src_miner_version)
   if [[ -n "$mv" && -n "$NET_MINER_VER" && "$mv" != "$NET_MINER_VER" ]]; then
@@ -584,16 +587,7 @@ build_proxi() {
 
 installed_version() { [[ -x "$BIN_DIR/proxi" ]] && "$BIN_DIR/proxi" version 2>/dev/null | awk '/Version:/{print $2}' || true; }
 
-install_binary() {
-  step "Installing proxi to $BIN_DIR"
-  local dst="$BIN_DIR/proxi"
-  as_user mkdir -p "$BIN_DIR" 2>/dev/null || as_root mkdir -p "$BIN_DIR"
-  if [[ -f "$dst" ]]; then { as_user cp -f "$dst" "$dst.prev" 2>/dev/null || as_root cp -f "$dst" "$dst.prev"; } || true; fi
-  { as_user install -m 0755 "$BUILD_OUT/proxi.new" "$dst.tmp" 2>/dev/null || as_root install -m 0755 "$BUILD_OUT/proxi.new" "$dst.tmp"; }
-  { as_user mv -f "$dst.tmp" "$dst" 2>/dev/null || as_root mv -f "$dst.tmp" "$dst"; }
-  rm -f "$BUILD_OUT/proxi.new"
-  [[ -z "$BUILT_COMMIT" ]] || printf '%s\n' "$BUILT_COMMIT" | as_user tee "$STAMP_FILE" >/dev/null
-  ok "proxi -> $dst"
+install_self() {
   # keep a copy of this script next to the install, so 'status' & co. work after a curl | bash
   local self="$MINER_HOME/proxima-gpu-miner.sh" u
   if [[ -n "$SELF_PATH" ]]; then
@@ -611,6 +605,19 @@ install_binary() {
       as_root ln -sf "$self" /usr/local/bin/proxima-gpu-miner 2>/dev/null && ok "shortcut: proxima-gpu-miner <command>" || true
     fi
   else warn "could not keep a copy of this script — save it as $self to use 'status'/'watch' later"; fi
+}
+
+install_binary() {
+  step "Installing proxi to $BIN_DIR"
+  local dst="$BIN_DIR/proxi"
+  as_user mkdir -p "$BIN_DIR" 2>/dev/null || as_root mkdir -p "$BIN_DIR"
+  if [[ -f "$dst" ]]; then { as_user cp -f "$dst" "$dst.prev" 2>/dev/null || as_root cp -f "$dst" "$dst.prev"; } || true; fi
+  { as_user install -m 0755 "$BUILD_OUT/proxi.new" "$dst.tmp" 2>/dev/null || as_root install -m 0755 "$BUILD_OUT/proxi.new" "$dst.tmp"; }
+  { as_user mv -f "$dst.tmp" "$dst" 2>/dev/null || as_root mv -f "$dst.tmp" "$dst"; }
+  rm -f "$BUILD_OUT/proxi.new"
+  [[ -z "$BUILT_COMMIT" ]] || printf '%s\n' "$BUILT_COMMIT" | as_user tee "$STAMP_FILE" >/dev/null
+  ok "proxi -> $dst"
+  install_self
   hash -r
 }
 
@@ -1128,7 +1135,9 @@ while [ "$i" -lt 360 ]; do
 done
 [ "$i" -lt 360 ] || echo "node $url not synced after 1 h — starting the miner anyway"
 
-args=(node mine --workers "$WORKERS")
+# -v: one "window ... at N H/s" line per round. Without it the miner prints a rate only when a round lasts >2 s,
+# which at low difficulty is almost never (the dashboard then has no hashrate to show)
+args=(node mine -v --workers "$WORKERS")
 if [ "$USE_GPU" = 1 ]; then
   # proxi starts the program called `nonce_seeker` (found first in SEEKER_PATH_DIR: it is gpu_seeker),
   # hands it the job server address, token and key, restarts it if it dies and stops it with the miner
@@ -1314,7 +1323,7 @@ dash_wallet() {
   [[ -n "$lrbs" ]] && kv "as of LRB" "${C_D}${lrbs:0:44}…${C_0}"
 
   # ---- delegations
-  local drows; drows=$(awk '/^ *DELEGATIONS \(/{f=1;next} f&&/^[A-Z]/{f=0} f&&/^ *(\$\/)?[0-9a-fA-F]{20,} /{print}' <<<"$B" || true)
+  local drows; drows=$(awk '/^ *DELEGATIONS \(/{f=1;next} f&&/^[A-Z]/{f=0} f{id=$1; sub(/^\$\//,"",id); if (length(id)>=20 && id ~ /^[0-9a-fA-F]+$/) print}' <<<"$B" || true)
   sect "DELEGATIONS"
   if [[ -z "$drows" ]]; then
     printf '  %s○ none yet%s %s— mining rewards are paid into delegations once the miner has won transits%s\n' "$C_Y" "$C_0" "$C_D" "$C_0"
@@ -1393,10 +1402,10 @@ dash_node() {
 miner_log() {
   local o=""
   if unit_installed; then
-    o=$(journalctl -u "$MINER_SVC" --no-pager -n 1500 -o cat 2>/dev/null || true)
-    [[ -n "$o" ]] || o=$(sudo -n journalctl -u "$MINER_SVC" --no-pager -n 1500 -o cat 2>/dev/null || true)
+    o=$(journalctl -u "$MINER_SVC" --no-pager -n 6000 -o cat 2>/dev/null || true)
+    [[ -n "$o" ]] || o=$(sudo -n journalctl -u "$MINER_SVC" --no-pager -n 6000 -o cat 2>/dev/null || true)
   else
-    o=$(tail -c 80000 "$LOG_FILE" 2>/dev/null || true)
+    o=$(tail -c 400000 "$LOG_FILE" 2>/dev/null || true)
   fi
   printf '%s' "$o" | tr '\r' '\n'
 }
@@ -1431,6 +1440,7 @@ dash_miner() {
                    improved) improved=$val;; err) err=$val;; tslot) tslot=$val;; lastn) lastn=$val;; esac
   done < <(awk '
     { if (match($0,/mining\.\.\. [0-9_]+ attempts +[0-9_]+ H\/s/)) { s=substr($0,RSTART,RLENGTH); n=split(s,f," "); r=f[4]; gsub(/_/,"",r); sm[++ns]=r }
+      if (match($0,/attempts at [0-9_]+ H\/s/)) { s=substr($0,RSTART,RLENGTH); n=split(s,f," "); r=f[3]; gsub(/_/,"",r); if (r+0>0) sm[++ns]=r }
       if (index($0,"totals:")) tot=substr($0,index($0,"totals:"))
       if (match($0,/difficulty K=[0-9]+/)) k=substr($0,RSTART+13,RLENGTH-13)
       if (match($0,/target slot [0-9]+/)) ts=substr($0,RSTART+12,RLENGTH-12)
@@ -1447,7 +1457,7 @@ dash_miner() {
     local sp; sp=$(tr ' ' '\n' <<<"$samples" | awk 'NF' | spark)
     [[ -n "$sp" ]] && kv "recent" "${C_C}$sp${C_0}"
   else
-    kv "hashrate" "${C_Y}no samples yet${C_0} ${C_D}(waiting for the node to sync / next mining round)${C_0}"
+    kv "hashrate" "${C_Y}no samples yet${C_0} ${C_D}(first mining round pending, or the launcher is older than 1.0.1: run '$0 update')${C_0}"
   fi
 
   # --- totals reported by the miner itself
@@ -1629,8 +1639,8 @@ cmd_check() {
   else warn "no valid answer from $url/api/v1/sync_info"; fi
   local pg; pg=$(public_genesis)
   if [[ -n "$pg" ]]; then
-    if [[ -n "$NP_GEN" && "$NP_GEN" == "$pg" ]]; then ok "same ledger as the public testnet (genesis $pg)"
-    elif [[ -n "$NP_GEN" ]]; then warn "DIFFERENT ledger: node genesis $NP_GEN, public testnet $pg"; fi
+    if [[ -n "$NP_GEN" && "$NP_GEN" == "$pg" ]]; then ok "same ledger as the public network (genesis $pg)"
+    elif [[ -n "$NP_GEN" ]]; then warn "DIFFERENT ledger: node genesis $NP_GEN, public network $pg"; fi
   fi
   if [[ -z "$NO_PUBLIC" ]]; then
     local i n=0
@@ -1866,6 +1876,8 @@ cmd_key() {
   svc start
 }
 
+launcher_stale() { [[ -f "$LAUNCHER" ]] && ! grep -q "generated by proxima-gpu-miner.sh $SCRIPT_VERSION " "$LAUNCHER"; }
+
 cmd_update() {
   step "Updating — branch $BRANCH"
   load_install
@@ -1883,6 +1895,10 @@ cmd_update() {
   have=$(cat "$STAMP_FILE" 2>/dev/null || true)
   if [[ -z "$have" || "$have" != "$(as_user git -C "$SRC_DIR" rev-parse HEAD)" || -n "${FORCE_REBUILD:-}" ]]; then need_proxi=1; fi
   if [[ "$USE_GPU" == 1 ]] && { gpu_stale || [[ -n "${FORCE_REBUILD:-}" ]]; }; then need_gpu=1; fi
+  if (( ! need_proxi && ! need_gpu )) && launcher_stale; then
+    log "the launcher is from an older script version: refreshing it (no rebuild needed)"
+    retire_cpu_service; install_self; save_conf; write_launcher; write_unit; svc restart; ok "launcher + script updated, miner restarted"; return 0
+  fi
   if (( ! need_proxi && ! need_gpu )); then
     ok "already running $old_v ($(printf '%.10s' "$have"))$([[ "$USE_GPU" == 1 ]] && echo ", GPU seeker up to date") — nothing to do"; return 0
   fi
