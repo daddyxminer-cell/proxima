@@ -4,8 +4,10 @@
 #                     wallet and miner from the master branch of
 #                     https://github.com/lunfardo314/proxima
 #
-#  Targets the current public testnet ("testnet5", node v0.13.x-testnet).
-#  A testnet reset keeps the version number but starts a NEW ledger (new genesis),
+#  Targets the current public network ("take 1", v1.0.x-take1, miner version 4).
+#  v1.0.1-take1 only changes `proxi` (miner fix); the ledger and the nodes are unchanged,
+#  so node operators do not need to upgrade, but miners should.
+#  A network reset keeps the version number but starts a NEW ledger (new genesis),
 #  so the script compares the genesis of the public nodes with that of your node DB
 #  and re-syncs from a fresh snapshot when they differ (see 'reset').
 #
@@ -36,7 +38,7 @@
 #
 #  Options (flags or environment variables):
 #    --home DIR            PROXIMA_HOME   base directory      (~/proxima)
-#    --branch NAME         BRANCH         git branch          (master)
+#    --branch NAME         BRANCH         git branch/tag/commit (master; e.g. v1.0.1-take1)
 #    --bin-dir DIR         BIN_DIR        where binaries go   (/usr/local/bin)
 #    --workers N           MINER_WORKERS  miner threads       (all CPUs)
 #    --max-khs X           MINER_MAX_KHS  hashrate cap, KH/s  (0 = none)
@@ -57,7 +59,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 REPO_URL="${REPO_URL:-https://github.com/lunfardo314/proxima.git}"
 
 # ---------- defaults ---------------------------------------------------------
@@ -297,17 +299,21 @@ check_clock() {
 fetch_source() {
   step "Source: $REPO_URL ($BRANCH)"
   as_user mkdir -p "$(dirname "$SRC_DIR")"
-  if [[ -d "$SRC_DIR/.git" ]]; then
-    local before; before=$(as_user git -C "$SRC_DIR" rev-parse --short HEAD)
-    as_user git -C "$SRC_DIR" fetch --quiet --tags origin "$BRANCH"
-    as_user git -C "$SRC_DIR" checkout --quiet "$BRANCH"
-    as_user git -C "$SRC_DIR" reset --quiet --hard "origin/$BRANCH"
-    local after; after=$(as_user git -C "$SRC_DIR" rev-parse --short HEAD)
-    [[ "$before" == "$after" ]] && ok "already at $after" || ok "updated $before -> $after"
-  else
-    as_user git clone --quiet --branch "$BRANCH" "$REPO_URL" "$SRC_DIR"
-    ok "cloned at $(as_user git -C "$SRC_DIR" rev-parse --short HEAD)"
+  if [[ ! -d "$SRC_DIR/.git" ]]; then
+    as_user git clone --quiet "$REPO_URL" "$SRC_DIR"
   fi
+  local before; before=$(as_user git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo none)
+  as_user git -C "$SRC_DIR" fetch --quiet --tags origin
+  if as_user git -C "$SRC_DIR" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
+    as_user git -C "$SRC_DIR" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+  else # a tag or a commit: pin the build to exactly that
+    as_user git -C "$SRC_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null || true
+    as_user git -C "$SRC_DIR" checkout --quiet --detach "$BRANCH" 2>/dev/null \
+      || die "'$BRANCH' is not a branch, tag or commit of $REPO_URL"
+    log "pinned to ${C_B}$BRANCH${C_0} (tag/commit, not a moving branch)"
+  fi
+  local after; after=$(as_user git -C "$SRC_DIR" rev-parse --short HEAD)
+  if [[ "$before" == "$after" ]]; then ok "already at $after"; else ok "now at $after (was $before)"; fi
   SRC_VERSION=$(grep -oE 'Version\s+=\s+"[^"]+"' "$SRC_DIR/global/version.go" | cut -d'"' -f2)
   log "source version: ${C_B}$SRC_VERSION${C_0}  ($(as_user git -C "$SRC_DIR" log -1 --format='%h %cd' --date=short))"
 }
@@ -595,7 +601,7 @@ WorkingDirectory=$WALLET_DIR
 Environment=PATH=$BIN_DIR:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-$ENV_DIR/miner.env
 ExecStartPre=$BIN_DIR/proxima-setup wait-sync $MINER_API
-ExecStart=$BIN_DIR/proxi node mine $workers_flag $khs_flag $seeker_flag $stream_flag
+ExecStart=$BIN_DIR/proxi node mine -v $workers_flag $khs_flag $seeker_flag $stream_flag
 Restart=always
 RestartSec=15
 TimeoutStartSec=infinity
@@ -667,7 +673,7 @@ fallback_svc() {
     ok "node started in background (pid $(cat "$PROXIMA_HOME/node.pid"), log $NODE_DIR/proxima.log)"
   fi
   if [[ "$which" =~ ^(all|miner)$ && "$NO_MINER" != 1 ]]; then
-    local extra=(); [[ -n "$MINER_WORKERS" ]] && extra+=(--workers "$MINER_WORKERS")
+    local extra=(-v); [[ -n "$MINER_WORKERS" ]] && extra+=(--workers "$MINER_WORKERS")
     [[ "$MINER_MAX_KHS" != 0 ]] && extra+=(--max-hashrate-khs "$MINER_MAX_KHS")
     [[ -x "$BIN_DIR/nonce_seeker" ]] && extra+=(--seeker)
     spawn_detached "$WALLET_DIR" "$WALLET_DIR/miner.log" "$PROXIMA_HOME/miner.pid" \
@@ -965,7 +971,7 @@ dash_wallet() {
   [[ -n "$lrbs" ]] && kv "as of LRB" "${C_D}${lrbs:0:44}…${C_0}"
 
   # ---- delegations
-  local drows; drows=$(awk '/^ *DELEGATIONS \(/{f=1;next} f&&/^[A-Z]/{f=0} f&&/^ *(\$\/)?[0-9a-fA-F]{20,} /{print}' <<<"$B" || true)
+  local drows; drows=$(awk '/^ *DELEGATIONS \(/{f=1;next} f&&/^[A-Z]/{f=0} f{id=$1; sub(/^\$\//,"",id); if (length(id)>=20 && id ~ /^[0-9a-fA-F]+$/) print}' <<<"$B" || true)
   sect "DELEGATIONS"
   if [[ -z "$drows" ]]; then
     printf '  %s○ none yet%s %s— mining rewards are paid into delegations once the miner has won transits%s\n' "$C_Y" "$C_0" "$C_D" "$C_0"
@@ -1026,6 +1032,7 @@ dash_miner() {
                    improved) improved=$val;; err) err=$val;; tslot) tslot=$val;; lastn) lastn=$val;; esac
   done < <(awk '
     { if (match($0,/mining\.\.\. [0-9_]+ attempts +[0-9_]+ H\/s/)) { s=substr($0,RSTART,RLENGTH); n=split(s,f," "); r=f[4]; gsub(/_/,"",r); sm[++ns]=r }
+      if (match($0,/attempts at [0-9_]+ H\/s/)) { s=substr($0,RSTART,RLENGTH); n=split(s,f," "); r=f[3]; gsub(/_/,"",r); if (r+0>0) sm[++ns]=r }
       if (index($0,"totals:")) tot=substr($0,index($0,"totals:"))
       if (match($0,/difficulty K=[0-9]+/)) k=substr($0,RSTART+13,RLENGTH-13)
       if (match($0,/target slot [0-9]+/)) ts=substr($0,RSTART+12,RLENGTH-12)
@@ -1074,9 +1081,11 @@ dash_software() {
   local iv pv; iv=$(installed_version); pv=$("$BIN_DIR/proxi" version 2>/dev/null | awk '/Version:/{print $2}' || true)
   kv "installed" "proxima ${C_C}${iv:-?}${C_0}  ${C_D}·${C_0}  proxi ${C_C}${pv:-?}${C_0}$([[ -x $BIN_DIR/nonce_seeker ]] && echo "  ${C_D}·${C_0}  nonce_seeker ${C_G}yes${C_0}")"
   if [[ -d "$SRC_DIR/.git" ]]; then
-    git -C "$SRC_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null || true
-    local rv; rv=$(git -C "$SRC_DIR" show "origin/$BRANCH:global/version.go" 2>/dev/null | grep -oE 'Version\s+=\s+"[^"]+"' | cut -d'"' -f2 || true)
-    local rh; rh=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true); local oh; oh=$(git -C "$SRC_DIR" rev-parse "origin/$BRANCH" 2>/dev/null || true)
+    git -C "$SRC_DIR" fetch --quiet --tags origin 2>/dev/null || true
+    local ur="origin/$BRANCH"
+    git -C "$SRC_DIR" rev-parse --verify --quiet "refs/remotes/$ur" >/dev/null 2>&1 || ur="$BRANCH"
+    local rv; rv=$(git -C "$SRC_DIR" show "$ur:global/version.go" 2>/dev/null | grep -oE 'Version\s+=\s+"[^"]+"' | cut -d'"' -f2 || true)
+    local rh; rh=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true); local oh; oh=$(git -C "$SRC_DIR" rev-parse "$ur^{commit}" 2>/dev/null || true)
     if [[ -n "$rv" && ( "$rv" != "$iv" || "$rh" != "$oh" ) ]]; then
       kv "upstream" "${C_Y}$BRANCH has ${rv} (${oh:0:8}) — update available: ${C_B}$0 update${C_0}"
     else kv "upstream" "${C_G}up to date${C_0} ${C_D}($BRANCH ${rv:-?})${C_0}"; fi
