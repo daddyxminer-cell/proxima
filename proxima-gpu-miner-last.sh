@@ -1868,8 +1868,9 @@ dash_gpu() {
       kv "GPU $idx" "${C_W}${name}${C_0}   ${C_D}${mu:-?}/${mt:-?} MiB${C_0}"
       printf '  %s%-17s%s %s %s%3s%%%s  %s%s°C%s  %s%s W%s%s  %s MHz%s\n' "$C_D" "" "$C_0" "$(bar "$util" 100 22 "$C_G")" "$C_W" "$util" "$C_0" \
         "$tc" "${temp:-?}" "$C_0" "$C_W" "${pw%.*}" "$C_0" "${plim:+${C_D}/ ${plim%.*}}" "${clk:-?}" "$C_0"
-      if (( util >= 90 )) && [[ "${pw%.*}" =~ ^[0-9]+$ && "${plim%.*}" =~ ^[0-9]+$ ]] && (( plim > 0 && pw * 100 / plim < 55 )); then
-        note "                    full load but only $((pw * 100 / plim))% of the power limit: the cores are stalled, not computing (see: $0 bench)"
+      local pwi="${pw%.*}" pli="${plim%.*}"      # nvidia-smi prints "450.00": shell arithmetic needs whole numbers
+      if (( util >= 90 )) && [[ "$pwi" =~ ^[0-9]+$ && "$pli" =~ ^[0-9]+$ ]] && (( pli > 0 && pwi * 100 / pli < 55 )); then
+        note "                    full load but only $((pwi * 100 / pli))% of the power limit: the cores are stalled, not computing (see: $0 bench)"
       fi
     done <<<"$smi"
   fi
